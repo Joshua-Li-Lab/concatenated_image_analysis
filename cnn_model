@@ -1,0 +1,325 @@
+# This script trains a CNN model for binary classification (cancer vs. normal) on tiled images of different types.
+# It processes multiple image types, performs multiple training iterations, evaluates performance, and saves results.
+# The code uses TensorFlow/Keras for model building, OpenCV for image processing, and scikit-learn for metrics.
+
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, classification_report, roc_curve, auc
+from tensorflow.keras import layers, models
+from tensorflow.keras.callbacks import ModelCheckpoint
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.utils import Sequence
+from sklearn.utils import shuffle
+import cv2  
+import time
+
+# Define paths to data folders and output directories
+base_folder = '/path/to/tiles'
+output_model_path = '/path/to/models'
+output_results_path = '/path/to/results'
+os.makedirs(output_results_path, exist_ok=True)
+
+# General hyperparameters and settings
+IMAGE_SIZE = (512, 512)  
+EPOCHS = 10  
+BATCH_SIZE = 32   
+INITIAL_LEARNING_RATE = 0.001  
+ITERATIONS = 40  
+
+# List of image types to process (e.g., different staining methods, concatenated or stacked images)
+image_types = ['H&E', 'MNF116', 'TTF1', 'p53', 'MIB1'] 
+
+# Load training and validation datasets from Excel files
+training_set_df = pd.read_excel('/path/to/train_set.xlsx')
+validation_set_df = pd.read_excel('/path/to/val_set.xlsx')
+
+# Helper function to construct standardized filenames for images (e.g., 23BX12345_H&E_cancer_0001_0001.tif)
+def construct_filename(specimen_number, tile_type, label, row, column):
+    return f"{specimen_number}_{tile_type}_{label}_{row:04d}_{column:04d}.tif"
+
+# Custom data generator class for loading images in batches
+class DataGenerator(Sequence):
+    def __init__(self, file_names, folder, labels, batch_size=32, image_size=(512, 512)):
+        self.file_names = file_names  
+        self.folder = folder  
+        self.labels = labels  
+        self.batch_size = batch_size
+        self.image_size = image_size
+        self.indices = np.arange(len(self.file_names)) 
+
+    def __len__(self):
+        return int(np.ceil(len(self.file_names) / self.batch_size))
+
+    def __getitem__(self, index):
+        batch_indices = self.indices[index * self.batch_size:(index + 1) * self.batch_size]
+        return self.__data_generation(batch_indices)
+
+    def __data_generation(self, batch_indices):
+        images = []
+        labels = []
+
+        for i in batch_indices:
+            img_name = self.file_names[i]
+            label = self.labels[i]
+
+            # Parse filename components to reconstruct full path
+            parts = img_name.split('_')
+            specimen_number = parts[0]
+            tile_type = parts[1]
+            label_part = parts[2]
+            row = int(parts[-2])
+            column = int(parts[-1].split('.')[0])
+
+            # Construct full image path
+            constructed_filename = construct_filename(specimen_number, tile_type, label_part, row, column)
+            img_path = os.path.join(self.folder, label_part, tile_type, constructed_filename)
+
+            if not os.path.exists(img_path):
+                print(f"[WARN] File does not exist: {img_path}")
+                continue
+
+            # Load image using OpenCV
+            img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
+            if img is None:
+                print(f"[WARN] Unable to read image: {img_path}")
+                continue
+
+            # Convert image to RGB if necessary
+            if img.shape[-1] == 4:
+                img = cv2.cvtColor(img, cv2.COLOR_RGBA2RGB)
+            elif img.shape[-1] == 3:
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+            # Resize image to target size
+            img = cv2.resize(img, self.image_size)
+            
+            images.append(img)
+            labels.append(1 if label == 'cancer' else 0)
+
+        # Convert lists to NumPy arrays and normalize pixel values to [0, 1]
+        images = np.array(images, dtype=np.float32) / 255.0
+        labels = np.array(labels, dtype=np.int32)
+
+        return images, labels
+
+# Function to create a simple CNN model for binary classification
+# Concatenated images used input_shape of (512,1024,3) and (512,2560,3)
+# Stacked images used Conv3D and input_shape of (2,512,512,3) and (5,512,512,3)
+def create_enhanced_cnn_model():
+    model = models.Sequential([
+        layers.Conv2D(32, (3, 3), activation='relu', input_shape=(512, 512, 3)),
+        layers.MaxPooling2D(pool_size=(2, 2)),
+        layers.Conv2D(64, (3, 3), activation='relu'),
+        layers.MaxPooling2D(pool_size=(2, 2)),
+        layers.Conv2D(128, (3, 3), activation='relu'),
+        layers.MaxPooling2D(pool_size=(2, 2)),
+        layers.Flatten(),
+        layers.Dense(128, activation='relu'),
+        layers.Dense(1, activation='sigmoid')
+    ])
+    return model
+
+# Function to plot training history (accuracy and loss)
+def plot_cnn_performance(img_type, history, iteration):
+    plt.figure(figsize=(12, 5))
+
+    # Accuracy subplot
+    plt.subplot(1, 2, 1)
+    epochs = range(1, len(history.history['accuracy']) + 1)
+    plt.plot(epochs, history.history['accuracy'], label='Training Accuracy')
+    plt.plot(epochs, history.history['val_accuracy'], label='Validation Accuracy')
+    plt.title(f'CNN Model Accuracy - Iteration {iteration}')
+    plt.ylabel('Accuracy')
+    plt.xlabel('Epoch')
+    plt.xticks(epochs)
+    plt.legend(loc='lower right')
+
+    # Loss subplot
+    plt.subplot(1, 2, 2)
+    plt.plot(epochs, history.history['loss'], label='Training Loss')
+    plt.plot(epochs, history.history['val_loss'], label='Validation Loss')
+    plt.title(f'CNN Model Loss - Iteration {iteration}')
+    plt.ylabel('Loss')
+    plt.xlabel('Epoch')
+    plt.xticks(epochs)
+    plt.legend(loc='upper right')
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_results_path, f'{img_type}_training_history_iteration_{iteration}.png'))
+    plt.close()
+
+# Function to plot ROC curve for validation predictions
+def plot_roc_curve(img_type, val_labels_numeric, val_probabilities, iteration):
+    fpr, tpr, _ = roc_curve(val_labels_numeric, val_probabilities.ravel())
+    roc_auc = auc(fpr, tpr)
+
+    plt.figure()
+    plt.plot(fpr, tpr, color='darkorange', lw=2, label='ROC curve (area = {:.3f})'.format(roc_auc))
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title(f'Receiver Operating Characteristic - Iteration {iteration}')
+    plt.legend(loc='lower right')
+    plt.savefig(os.path.join(output_results_path, f'{img_type}_roc_curve_iteration_{iteration}.png'))
+    plt.close()
+
+# List to store summary results from all iterations
+all_iteration_results = []
+
+# Main loop: Repeat training for the specified number of iterations
+for i in range(ITERATIONS):
+    print(f"Training iteration {i + 1}/{ITERATIONS}...")
+    
+    # Process each image type separately
+    for img_type in image_types:
+        # Filter data for the current image type
+        train_cancer = training_set_df[(training_set_df['Type'] == img_type) & (training_set_df['Label'] == 'cancer')]['File_Name'].tolist()
+        train_normal = training_set_df[(training_set_df['Type'] == img_type) & (training_set_df['Label'] == 'normal')]['File_Name'].tolist()
+        val_cancer = validation_set_df[(validation_set_df['Type'] == img_type) & (validation_set_df['Label'] == 'cancer')]['File_Name'].tolist()
+        val_normal = validation_set_df[(validation_set_df['Type'] == img_type) & (validation_set_df['Label'] == 'normal')]['File_Name'].tolist()
+
+        # Print dataset sizes for debugging
+        print(f"Training Set {img_type}: {len(train_cancer)} Cancer images, {len(train_normal)} Normal images")
+        print(f"Validation Set {img_type}: {len(val_cancer)} Cancer images, {len(val_normal)} Normal images")
+
+        # Prepare training data and shuffle
+        train_file_names = train_cancer + train_normal
+        train_labels = ['cancer'] * len(train_cancer) + ['normal'] * len(train_normal)
+        train_file_names, train_labels = shuffle(train_file_names, train_labels, random_state=42)
+
+        # Prepare validation data and shuffle
+        val_file_names = val_cancer + val_normal
+        val_labels = ['cancer'] * len(val_cancer) + ['normal'] * len(val_normal)
+        val_file_names, val_labels = shuffle(val_file_names, val_labels, random_state=42)
+
+        # Create data generators for training and validation
+        train_generator = DataGenerator(train_file_names, base_folder, train_labels, batch_size=BATCH_SIZE, image_size=IMAGE_SIZE)
+        val_generator = DataGenerator(val_file_names, base_folder, val_labels, batch_size=BATCH_SIZE, image_size=IMAGE_SIZE)
+
+        # Create and compile the CNN model
+        cnn_model = create_enhanced_cnn_model()
+        cnn_model.compile(loss='binary_crossentropy', optimizer=Adam(learning_rate=INITIAL_LEARNING_RATE), metrics=['accuracy'])
+
+        # Define model checkpoint callback (saves best model based on val_loss)
+        checkpoint = ModelCheckpoint(os.path.join(output_model_path, f'best_model_iteration_{i + 1}.keras'), save_best_only=True, monitor='val_loss', mode='min')
+
+        # Measure training time
+        training_start_time = time.time()
+        
+        # Train the model
+        cnn_history = cnn_model.fit(
+            train_generator,
+            validation_data=val_generator,
+            epochs=EPOCHS,
+            callbacks=[checkpoint],
+            verbose=1
+        )
+        
+        # Calculate training time
+        training_end_time = time.time()
+        training_time = training_end_time - training_start_time
+
+        # Measure validation time (including predictions)
+        validation_start_time = time.time()
+        
+        # Generate predictions on validation set
+        val_probabilities = cnn_model.predict(val_generator)
+        val_predictions = (val_probabilities > 0.5).astype(int)
+        
+        # Calculate validation time
+        validation_end_time = time.time()
+        validation_time = validation_end_time - validation_start_time
+        
+        # Total time for training + validation
+        total_time = training_time + validation_time
+
+        # Convert validation labels to numeric (1 for cancer, 0 for normal)
+        val_labels_numeric = [1 if label == 'cancer' else 0 for label in val_labels]
+
+        # Collect results for validation set
+        results = []
+        for name, orig_label, prob in zip(val_file_names, val_labels, val_probabilities):
+            predicted_label = 1 if prob[0] > 0.5 else 0
+            orig_label_numeric = 1 if orig_label == 'cancer' else 0
+            results.append({
+                'Type': img_type,
+                'Iteration': i + 1,
+                'image_name': name,
+                'original_label': orig_label_numeric,
+                'predicted_label': predicted_label,
+                'probability': float(prob[0]),
+                'Set': 'Validation'
+            })
+
+        # Generate predictions on training set and add to results
+        train_probabilities = cnn_model.predict(train_generator)
+        for name, orig_label, prob in zip(train_file_names, train_labels, train_probabilities):
+            predicted_label = 1 if prob[0] > 0.5 else 0
+            orig_label_numeric = 1 if orig_label == 'cancer' else 0
+            results.append({
+                'Type': img_type,
+                'Iteration': i + 1,
+                'image_name': name,
+                'original_label': orig_label_numeric,
+                'predicted_label': predicted_label,
+                'probability': float(prob[0]),
+                'Set': 'Training'
+            })
+
+        # Save iteration results to DataFrame and Excel
+        df_iteration_results = pd.DataFrame(results)
+        iteration_results_file_path = os.path.join(output_results_path, f'{img_type}_results_iteration_{i + 1}.xlsx')
+        df_iteration_results.to_excel(iteration_results_file_path, index=False)
+
+        # Calculate evaluation metrics
+        cm = confusion_matrix(val_labels_numeric, val_predictions.ravel())
+        report = classification_report(val_labels_numeric, val_predictions.ravel(), target_names=['Normal', 'Cancer'], zero_division=1, output_dict=True)
+        fpr, tpr, _ = roc_curve(val_labels_numeric, val_probabilities.ravel())
+        roc_auc = auc(fpr, tpr)
+
+        # Create summary dictionary for this iteration
+        iteration_summary = {
+            'Image Type': 'ByType',
+            'Type': img_type,
+            'Iteration': i + 1,
+            'Training Cancer Count': len(train_cancer),
+            'Training Normal Count': len(train_normal),
+            'Validation Cancer Count': len(val_cancer),
+            'Validation Normal Count': len(val_normal),
+            'Accuracy': report['accuracy'],
+            'Precision': report['Cancer']['precision'],
+            'Recall': report['Cancer']['recall'],
+            'F1 Score': report['Cancer']['f1-score'],
+            'ROC AUC': roc_auc,
+            'Training Time (s)': training_time,
+            'Validation Time (s)': validation_time,
+            'Total Time (s)': total_time
+        }
+
+        # Append to overall results list
+        all_iteration_results.append(iteration_summary)
+
+        # Save confusion matrix as heatmap image
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['Normal', 'Cancer'], yticklabels=['Normal', 'Cancer'])
+        plt.ylabel('Actual')
+        plt.xlabel('Predicted')
+        plt.title(f'Confusion Matrix for Iteration {i + 1}')
+        plt.savefig(os.path.join(output_results_path, f'{img_type}_confusion_matrix_iteration_{i + 1}.png'))
+        plt.close()
+
+        # Plot ROC curve and training performance
+        plot_roc_curve(img_type, val_labels_numeric, val_probabilities, i + 1)
+        plot_cnn_performance(img_type, cnn_history, i + 1)
+
+# Save summary of all iterations to Excel
+df_summary_results = pd.DataFrame(all_iteration_results)
+summary_file_path = os.path.join(output_results_path, 'model_metrics_summary.xlsx')
+df_summary_results.to_excel(summary_file_path, index=False)
+
+print(f"Results for all iterations have been saved in the Excel file {summary_file_path}.")
